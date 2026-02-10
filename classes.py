@@ -524,7 +524,7 @@ class MakeTable():
         self.__add_str__(ws, 'D48', 'фамилия ответственного', js)
         wb.save(save_path)
 class Img2Xlsx():
-    def __init__(self, parser_path, pars_dir='./results'):
+    def __init__(self, parser_path='./utils/parser.pt', pars_dir='./utils/pars_img'):
         self.img2js=Img2Json(parser_path, pars_dir)
         self.maketable=MakeTable()
     def convert(self, img_path, table_path):
