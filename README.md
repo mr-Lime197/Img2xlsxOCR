@@ -16,7 +16,7 @@ clone this git repository into your project
 
 ```git clone https://github.com/mr-Lime197/Img2xlsxOCR.git ```
 
-in the file classes.py the main class `Img2Xlsx` is located. **IMPORTANT: A VPN CONNECTION IS REQUIRED TO WORK.*
+in the file classes.py the main class `Img2Xlsx` is located. **IMPORTANT: A VPN CONNECTION IS REQUIRED TO WORK.**
 ### Sample usage
 ```
 from classes import Img2Xlsx
