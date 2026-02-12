@@ -345,7 +345,7 @@ class MakeTable():
         except:
             ws[cell].fill=self.er_fill
             return
-        ws[cell]=self.is_num(num)
+        ws[cell]=self.__is_num__(num)
         if styling and self.is_num(num)!='':
             ws[cell].fill=PatternFill(start_color='CCFFCC',
                                 end_color='CCFFCC',
