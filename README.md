@@ -25,5 +25,5 @@ table_name=input('path/name result table:')
 model=Img2Xlsx()
 model.convert(pars_img, table_name)
 ```
-* pars_img - path to your image with document
+* pars_img - path to your image with document (recomended .jpg file format)
 * table_name - path/name to your result xlsx file
