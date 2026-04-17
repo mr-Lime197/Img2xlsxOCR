@@ -14,11 +14,26 @@ from openpyxl.styles import PatternFill
 from openpyxl.styles import Border, Side, Font, Alignment
 from tqdm import tqdm
 
+# --- Настройка глобального устройства ---
+def get_best_device():
+    if torch.cuda.is_available():
+        return "cuda", torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    elif torch.backends.mps.is_available():
+        return "mps", torch.float32
+    else:
+        return "cpu", torch.float32
+
+DEVICE, DTYPE = get_best_device()
+print(f"Используется устройство: {DEVICE}, dtype: {DTYPE}")
+
 class Parser():
-    def __init__(self, model_path:str, OFFSET:float=2, CONF_LEVEL:float=0.5):
-        self.model=YOLO(model_path)
-        self.OFFSET = OFFSET  # Теперь этот параметр реально расширит видимую область вокруг объекта
+    def __init__(self, model_path: str, OFFSET: float = 2, CONF_LEVEL: float = 0.5):
+        # YOLO сам выберет GPU, если доступно. Явно укажем device.
+        self.model = YOLO(model_path)
+        self.model.to(DEVICE)  # Ultralytics поддерживает .to()
+        self.OFFSET = OFFSET
         self.CONF_LEVEL = CONF_LEVEL
+
     def __resize_with_padding(self, image, target_size=(640, 640), background_color=(255, 255, 255)):
         h, w = image.shape[:2]
         scale = min(target_size[0] / h, target_size[1] / w)
@@ -31,56 +46,57 @@ class Parser():
         y_offset = (target_size[1] - new_h) // 2
         canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
         return canvas
-    def predict(self, img_path:str, result_path:str):
-        model=self.model
-        results = model.predict(source=img_path, conf=self.CONF_LEVEL, imgsz=640)
+
+    def predict(self, img_path: str, result_path: str):
+        # YOLO predict уже использует GPU, если модель на GPU
+        results = self.model.predict(source=img_path, conf=self.CONF_LEVEL, imgsz=640, device=DEVICE)
         for result in results:
             img = result.orig_img
             if result.masks is not None:
                 for i, mask in enumerate(result.masks.data):
-                    # 1. Получаем координаты и расширяем их
                     x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
 
                     x1_off = max(0, x1 - self.OFFSET)
                     y1_off = max(0, y1 - self.OFFSET)
                     x2_off = min(img.shape[1], x2 + self.OFFSET)
-                    y2_off = min(img.shape[0], y2 +self.OFFSET)
+                    y2_off = min(img.shape[0], y2 + self.OFFSET)
 
-                    # 2. ВЫРЕЗАЕМ кусок из ОРИГИНАЛЬНОГО изображения (с фоном)
                     cropped_img = img[y1_off:y2_off, x1_off:x2_off].copy()
 
-                    # 3. Готовим маску именно для этого вырезанного куска
                     full_mask = mask.cpu().numpy()
                     full_mask = cv2.resize(full_mask, (img.shape[1], img.shape[0]))
 
-                    # Вырезаем ту же область из маски
                     cropped_mask = full_mask[y1_off:y2_off, x1_off:x2_off]
                     binary_mask = (cropped_mask > 0.5).astype(np.uint8)
 
-                    # 4. (Опционально) Если ты хочешь, чтобы ВНЕ маски был белый фон,
-                    # но внутри OFFSET был виден фон — оставь как есть.
-                    # Если хочешь ОСТАВИТЬ ОРИГИНАЛЬНЫЙ ФОН внутри OFFSET — закомментируй следующие 3 строки:
-                    # mask_3d = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2)
-                    # white_bg = np.full(cropped_img.shape, 255, dtype=np.uint8)
-                    # cropped_img = np.where(mask_3d == 1, cropped_img, white_bg)
-
-                    # 5. Ресайз
                     final_img = self.__resize_with_padding(cropped_img)
                     cv2.imwrite(f'{result_path}/{result.names[int(result.boxes.cls[i])]}.jpg', final_img)
+
+
 class SimpleOCR():
-    def __init__(self, save_directory:str='./local_model'):
-        model_path='lightonai/LightOnOCR-2-1B-base'
-        self.device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = torch.float32 if self.device == "mps" else torch.bfloat16
-        self.model = LightOnOcrForConditionalGeneration.from_pretrained("lightonai/LightOnOCR-2-1B-base").to(self.device)
-        self.processor = LightOnOcrProcessor.from_pretrained("lightonai/LightOnOCR-2-1B-base")
-        # except:
-        #     self.model = AutoModelForImageTextToText.from_pretrained(model_path)
-        #     self.processor = AutoProcessor.from_pretrained(model_path)
-        #     self.model.save_pretrained(save_directory)
-        #     self.processor.save_pretrained(save_directory)
+    def __init__(self, save_directory: str = './local_model'):
+        model_path = 'lightonai/LightOnOCR-2-1B-base'
+        self.device = DEVICE
+        self.dtype = DTYPE
+
+        # Загружаем модель на GPU с поддержкой torch.compile (если версия позволяет)
+        self.model = LightOnOcrForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=self.dtype,
+            device_map="auto"
+        ).to(self.device)
+        self.processor = LightOnOcrProcessor.from_pretrained(model_path)
         self.model.eval()
-    def predict(self, img_path:str, max_new_tokens:int=4096, prompt:str='extract the data from the image and provide it as a json file'):
+        # Включим torch.compile для ускорения инференса (опционально)
+        if hasattr(torch, 'compile') and DEVICE == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+            except Exception as e:
+                print(f"torch.compile не поддерживается: {e}")
+
+    @torch.inference_mode()
+    def predict(self, img_path: str, max_new_tokens: int = 4096,
+                prompt: str = 'extract the data from the image and provide it as a json file'):
         conversation = [{"role": "user", "content": [{"type": "image", "url": img_path}]}]
         inputs = self.processor.apply_chat_template(
             conversation,
@@ -89,53 +105,59 @@ class SimpleOCR():
             return_dict=True,
             return_tensors="pt",
         )
-        inputs = {k: v.to(device=self.device, dtype=self.dtype) if v.is_floating_point() else v.to(self.device) for k, v in inputs.items()}
+        # Явно переносим тензоры на GPU
+        inputs = {k: v.to(device=self.device, dtype=self.dtype if v.is_floating_point() else None)
+                  for k, v in inputs.items()}
 
         output_ids = self.model.generate(**inputs, max_new_tokens=1024)
         generated_ids = output_ids[0, inputs["input_ids"].shape[1]:]
         output_text = self.processor.decode(generated_ids, skip_special_tokens=True)
         return output_text
 
+
 class HardOCR():
-    def predict(self, img_path:str, output_type:str='flat-json'):
+    def predict(self, img_path: str, output_type: str = 'flat-json'):
         url = "https://extraction-api.nanonets.com/extract"
-        headers = {"Authorization":"Bearer c6163645-e3d4-11f0-9665-a23842209c4a"}
+        headers = {"Authorization": "Bearer c6163645-e3d4-11f0-9665-a23842209c4a"}
         files = {"file": open(img_path, "rb")}
         data = {"output_type": output_type}
         data["model"] = "nanonets"
         response = requests.post(url, headers=headers, files=files, data=data)
         return response.json()
+
+
 class LLM():
-    def __init__(self, model_name:str="Qwen/Qwen3-1.7B"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-1.7B"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype="auto",
+            torch_dtype=DTYPE,
             device_map="auto"
         )
-    def predict(self, std_prompt = "извлеки мне из текста: '$$' значение всех колонок и полей, предоставь в формате json, продоставь только значение этого файла, если какое-то значение пустое или только из нижних подчеркиваний то замени его на значение nan", list_content:list=[]):
-        prompt=std_prompt.replace('$$','\n'.join(list_content))
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
+        self.model.eval()
+        if hasattr(torch, 'compile') and DEVICE == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+            except Exception as e:
+                print(f"torch.compile не поддерживается: {e}")
+
+    @torch.inference_mode()
+    def predict(self, std_prompt: str = "извлеки мне из текста: '$$' значение всех колонок и полей...",
+                list_content: list = []):
+        prompt = std_prompt.replace('$$', '\n'.join(list_content))
+        messages = [{"role": "user", "content": prompt}]
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True # Switches between thinking and non-thinking modes. Default is True.
+            enable_thinking=True
         )
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
-        # conduct text completion
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=32768
-        )
+        generated_ids = self.model.generate(**model_inputs, max_new_tokens=32768)
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
 
-        # parsing thinking content
         try:
-            # rindex finding 151668 (</think>)
             index = len(output_ids) - output_ids[::-1].index(151668)
         except ValueError:
             index = 0
@@ -143,27 +165,35 @@ class LLM():
         thinking_content = self.tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip("\n")
         content = self.tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
         return content.replace("```", '').replace('json', '').replace('\n', '').lower()
+
+
 class VLLM():
     def __init__(self):
-        model_path='Qwen/Qwen3-VL-2B-Instruct'
+        model_path = 'Qwen/Qwen3-VL-2B-Instruct'
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path, dtype="auto", device_map="auto"
+            model_path,
+            torch_dtype=DTYPE,
+            device_map="auto"
         )
         self.processor = AutoProcessor.from_pretrained(model_path)
+        self.model.eval()
+        if hasattr(torch, 'compile') and DEVICE == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+            except Exception as e:
+                print(f"torch.compile не поддерживается: {e}")
+
+    @torch.inference_mode()
     def predict(self, img_path, prompt):
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image",
-                        "image": img_path,
-                    },
+                    {"type": "image", "image": img_path},
                     {"type": "text", "text": prompt},
                 ],
             }
         ]
-        # Preparation for inference
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -173,37 +203,45 @@ class VLLM():
         )
         inputs = inputs.to(self.model.device)
 
-        # Inference: Generation of the output
         generated_ids = self.model.generate(**inputs, max_new_tokens=512)
         generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         output_text = self.processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
         return output_text[0].replace("```", '').replace('json', '').replace('\n', '').lower()
+
+
 class Img2Json():
-    def __init__(self, parser_path, img_dir='./results'):
-        self.parser=Parser(parser_path)
-        self.simple=SimpleOCR()
-        self.hard=HardOCR()
-        self.vllm=VLLM()
-        self.llm=LLM()
-        self.img_dir=img_dir
-        pass
+    def __init__(self, parser_path, parser_row_path, img_dir='./results'):
+        self.parser = Parser(parser_path)
+        self.parser_rows = Parser(parser_row_path, CONF_LEVEL=0.1)
+        self.simple = SimpleOCR()
+        self.hard = HardOCR()
+        self.vllm = VLLM()
+        self.llm = LLM()
+        self.img_dir = img_dir
+
     def pars(self, img_path):
-        lst=[]
+        lst = []
         prompt_simple='''
         извлеки мне из текста: '$$' следующие значения:
-        \nдата
-        \nбрак в кг
-        \nсколько сдаю рулонов
-        \nномер заказа
-        \nномер задания на перемотку
-        \nсколько джамб перемотать
-        \nфамилия ответственного
-        \nобщий вес в кг
-        \nномер смены
+        \n сколько сдаю рулонов (в штуках)
+        \n сколько шпуль (в штуках)
+        \n дата
+        \n номер заказа
+        \n задание на перемотку
+        \n сколько перемотать джамб (в штуках)
+        \n пленки упак (в метрах)
+        \n фамилия ответственного
+        \n общий вес (в килограммах)
+        \n номер смены
+        \n продолжил задание (фамилия)
+        \n задание закончил (фамилия)
+        \n задание начал (фамилия)
+        \n задание передал (фамилия)
+        \n заголовок
         \nпредоставь в формате json, продоставь только значение этого файла, если какое-то значение пустое или только из нижних подчеркиваний то замени его на значение "nan" Очень важно именно в кавычках.
         '''
         prompt_vllm='''
@@ -219,25 +257,29 @@ class Img2Json():
         \n вес расчетный общий находится правее всего, поэтому возможно поехал немного вниз, учти это
         \n предоставь в формате json, продоставь только значение этого файла, если какое-то значение пустое или только из нижних подчеркиваний то замени его на значение "nan"
         '''
-        img_dir=self.img_dir
+        img_dir = self.img_dir
         os.makedirs(img_dir, exist_ok=True)
+        for i in range(1, 6):
+            os.makedirs(f'{img_dir}/roll{i}', exist_ok=True)
+        os.makedirs(f'{img_dir}/weight_djamb', exist_ok=True)
+
         self.parser.predict(img_path, img_dir)
-        js={}
-        lst=[]
-        for file in tqdm(os.listdir(img_dir)):
-            if file=='djamb.jpg':
-                s=self.vllm.predict(img_dir+'/'+file, prompt_vllm)
-                s=s.replace('json', '').replace('```', '').replace('\n', '').lower()
-                print(eval(s))
-                js=js|eval(s)
+        js = {}
+        lst = []
+
+        for file in tqdm(list(filter(lambda x: x.count('.') > 0, os.listdir(img_dir)))):
+            if file == 'djamb.jpg':
+                s = self.vllm.predict(img_dir + '/' + file, prompt_vllm)
+                s = s.replace('json', '').replace('```', '').replace('\n', '').lower()
+                try:
+                    js.update(eval(s))
+                except:
+                    print(f"Ошибка eval для {file}")
                 continue
-            if file=='table1.jpg' or file=='table2.jpg':
-                if file=='table1.jpg':
-                    res=self.hard.predict(img_dir+'/'+file)
-                else:
-                    res=self.hard.predict(img_dir+'/'+file, output_type='markdown')
+            if file == 'table1.jpg':
+                res = self.hard.predict(img_dir + '/' + file)
                 if res['success']:
-                    s=res['content']
+                    s = res['content']
                 else:
                     print('ERROR: hard model is crashed')
                     prompt='''
@@ -253,56 +295,83 @@ class Img2Json():
                     \n очень важно сохранить пустые ячейки пустыми
                     \n предоставь ответ в формате json
                     '''
-                    s=self.vllm.predict(img_dir+'/'+file, prompt)
-                if file=='table1.jpg':
-                    prompt='''
-                    распарси текст в виде json файла и достань от туда значения следующих ячеек:
-                    \n делить по длинне (представляет натурально число)
-                    \n информацию по каждому рулону (Номер рулона находится в самой левой колонке, предоставь в виде списка значений в строке с названием этого рулона. Если значение пропущено, но поставь 'nan')
-                    \n обрезь (аналогично рулонам, необходио предоставить в виде list)
-                    \n полезный вес
-                    \n
-                    \n в таблице присутствуют ровно 5 рулонов, каждый из них необходимо обработать, в каждом списке рулона должно быть ровно 6 значений.
-                    \n все значения в ячейках представляют из себя либо вещественное число, либо натуральное, либо пустое значение.
-                    \n очень важно сохранить пустые ячейки пустыми
-                    \n предоставь ответ в формате json
-                    \n вот тебе названия ключей списком: [делить по длине, рулон 1, рулон 2, рулон 3, рулон 4, рулон 5, обрезь, полезный вес]
-                    \n полезный вес - это одно число
-                    \n пример твоего ответа: '{"делить по длине":"2", "рулон 1":["23", "234", "nan", "12.32", "432", "4"], "рулон 2":["nan", "nan", "3432", "12.32", "432", "4"], "рулон 3":["235", "24", "32", "12.32", "432", "5"], "рулон 4":["23", "234", "43", "nan", "432", "4"], "рулон 5":["23", "234", "nan", "12.32", "432", "4"], "обрезь":["23", "234", "nan", "12.32", "432", "4"], "Полезный вес":"143.2"}'
-                    \n сам текст для анализа:
-                    \n $$
-                    '''
-                else:
-                    prompt='''
-                    распарси markdown текст и достань от туда значения следующих ячеек:
-                    \n вес джамбы (первая колонка)
-                    \n вес рулона 1(вторая колонка)
-                    \n вес рулона 2(третья колонка)
-                    \n вес рулона 3(четвертая колонка)
-                    \n вес рулона 4(пятая колонка)
-                    \n вес рулона 5(шестая колонка)
-                    \n вес брака/обрези (седьмая колонка)
-                    \n ВАЖНО: предоставь в виде json файла где ключ - это название колонки, значение - это list из значений этой колонки, если ячейка пустая заполни значением 'nan', важно сохранить количество строк как в исходном файле.
-                    \n твой ответ должен быть обернут в {}
-                    \n СДЕЛАЙ ВСЕ ЕДИНЫМ JSON ФАЙЛОМ
-                    \n вот тебе названия ключей списком: [вес джамбы, вес рулона 1,  вес рулона 2,  вес рулона 3,  вес рулона 4,  вес рулона 5, вес брака/обрези]
-                    \n пример твоего ответа: '{"вес джамбы":["13", "0", "nan", "16"...], "вес рулона 1":["267", "14.2", "42.123"...]...}'
-                    \n сам текст для анализа:
-                    \n $$
-                    '''
-                d=self.llm.predict(std_prompt=prompt, list_content=[s])
-                print(d)
-                js=js|eval(d)
+                    s = self.vllm.predict(img_dir + '/' + file, prompt)
+                prompt='''
+                распарси текст в виде json файла и достань от туда значения следующих ячеек:
+                \n делить по длинне (представляет натурально число)
+                \n информацию по каждому рулону (Номер рулона находится в самой левой колонке, предоставь в виде списка значений в строке с названием этого рулона. Если значение пропущено, но поставь 'nan')
+                \n обрезь (аналогично рулонам, необходио предоставить в виде list)
+                \n полезный вес
+                \n
+                \n в таблице присутствуют ровно 5 рулонов, каждый из них необходимо обработать, в каждом списке рулона должно быть ровно 6 значений.
+                \n все значения в ячейках представляют из себя либо вещественное число, либо натуральное, либо пустое значение.
+                \n очень важно сохранить пустые ячейки пустыми
+                \n предоставь ответ в формате json
+                \n вот тебе названия ключей списком: [делить по длине, рулон 1, рулон 2, рулон 3, рулон 4, рулон 5, обрезь, полезный вес]
+                \n полезный вес - это одно число
+                \n пример твоего ответа: '{"делить по длине":"2", "рулон 1":["23", "234", "nan", "12.32", "432", "4"], "рулон 2":["nan", "nan", "3432", "12.32", "432", "4"], "рулон 3":["235", "24", "32", "12.32", "432", "5"], "рулон 4":["23", "234", "43", "nan", "432", "4"], "рулон 5":["23", "234", "nan", "12.32", "432", "4"], "обрезь":["23", "234", "nan", "12.32", "432", "4"], "Полезный вес":"143.2"}'
+                \n сам текст для анализа:
+                \n $$
+                '''
+                d = self.llm.predict(std_prompt=prompt, list_content=[s])
+                try:
+                    js.update(eval(d))
+                except:
+                    print(f"Ошибка eval для table1")
                 continue
-            if file=='title.jpg':
-              js['заголовок']=self.simple.predict(img_dir+'/'+file)
-              continue
-            lst.append(self.simple.predict(img_dir+'/'+file))
-        g=str(self.llm.predict(prompt_simple, lst)).replace('null', 'nan')
+            if file == 'title.jpg':
+                js['заголовок'] = self.simple.predict(img_dir + '/' + file)
+                continue
+            if file[:4] == 'roll':
+                folder_path = f'{img_dir}/{file[:-4]}'
+                self.parser_rows.predict(f'{img_dir}/{file}', folder_path)
+                num_roll = int(file[4])
+                lst2 = [''] * 17
+                for file2 in os.listdir(folder_path):
+                    num_row = int(file2[3:-4])
+                    val = self.vllm.predict(f'{folder_path}/{file2}',
+                                             prompt="return ONLY VALUES. delete another text, delete ',' and join in in string all number")
+                    if num_row != 0:
+                        if num_roll % 2 == 1:
+                            try:
+                                val = float(f'{val[-3:-1]}.{val[-1]}')
+                            except:
+                                print(f'Ошибка в распознавании {num_roll} столбца, {num_row} строки')
+                        else:
+                            try:
+                                val = f'{val[:2]}.{val[3]}'
+                            except:
+                                print(f'Ошибка в распознавании {num_roll} столбца, {num_row} строки')
+                    lst2[num_row] = val
+                js[f'вес рулона {num_roll}'] = lst2
+                continue
+            if file == 'weight_djamb.jpg':
+                folder_path = f'{img_dir}/weight_djamb'
+                self.parser_rows.predict(f'{img_dir}/{file}', folder_path)
+                lst2 = [''] * 17
+                for file2 in os.listdir(folder_path):
+                    num_row = int(file2[3:-4])
+                    val = self.vllm.predict(f'{folder_path}/{file2}',
+                                             prompt="return ONLY VALUES. delete another text, delete ',' and join in in string all number")
+                    try:
+                        val = f'{val[:3]}.{val[3]}'
+                    except:
+                        print(f'Ошибка в распознавании 0 столбца, {num_row} строки')
+                    lst2[num_row] = val
+                js['вес джамбы'] = lst2
+                continue
+            if file == 'weight_trash.jpg':
+                continue
+            try:
+                lst.append(self.simple.predict(img_dir + '/' + file))
+            except:
+                print(f"ошибка обработки {file}")
+
+        g = str(self.llm.predict(prompt_simple, lst)).replace('null', 'nan')
         try:
-          js=js|eval(g)
+            js.update(eval(g))
         except:
-          print(f'ошибка обработки файла {file}\n вывод\n{g}')
+            print(f'ошибка обработки файла {file}\n вывод\n{g}')
         return js
 class MakeTable():
     def __init__(self):
